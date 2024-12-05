@@ -3,7 +3,7 @@ import aerosandbox.numpy as np
 import neuralfoil as nf
 import pandas as pd
 import shapely
-
+import math
 
 
 
@@ -52,8 +52,6 @@ def get_upper_camber_length(airfoil_filepath):
     # Sum all distances to get the upper camber length
     upper_camber_length = np.sum(dist_array)
     return(upper_camber_length)
-
-
 
 def calc_CD0_regression(airfoilfile, re_list=np.linspace(1e5,1e6,10)):
     def fit_power_law(x, y):
@@ -126,8 +124,22 @@ def calc_CD0_regression(airfoilfile, re_list=np.linspace(1e5,1e6,10)):
     prefactor,expofactor = fit_power_law(re_list,cd0_list)
     return prefactor,expofactor
 
+def calc_lift_curve_slope(airfoil_file):
+    cl1 = nf.get_aero_from_dat_file(
+                filename=airfoil_file,
+                alpha=-2,
+                Re=3e5,
+                model_size='xlarge'
+            )["CL"]
+    cl2 = nf.get_aero_from_dat_file(
+                filename=airfoil_file,
+                alpha=5,
+                Re=3e5,
+                model_size='xlarge'
+            )["CL"]
+    return (cl2-cl1)/7
 
-opti = asb.Opti()  # initialize an optimization environment
+
 
 ## Constants
 g= 9.81 #acceleration of gravity
@@ -138,32 +150,55 @@ sp_power = 173.2 #W/M2 energy generated per solar panel.
 foam_density = 30.2# Pink Insulation Foam Density kg/m^3
 solar_panel_mass = 0.001 #Mass (kg) per solar panel (incl solder)
 solar_panel_size = 0.125 #solar panel size (m)
+stabilizer_efficiency = 0.8
 
 
 ##Aircraft Parameters
 weight_fuselage = 30 #Fuselage weight newtons
 cm_cp_distance = 0.05 #Not yet used
-wing_aoa = 3 #Wing aoa (degrees)
+#wing_aoa = 3 #Wing aoa (degrees)
 drag_area_fuselage = 0.0001 #fuselage fontal area (m^2)
 flat_legth_percent = 0.83 #ratio of flat length to chordlength
 airfoilfile = "C:\\Users\\curra\\Documents\\Freshman\\Solar_Airplane\\Prototype 3\\NACA23012.dat"
+hstab_airfoil_file = "C:\\Users\\curra\\Documents\\Freshman\\Solar_Airplane\\Prototype 3\\AG35.dat"
 airfoil_area = get_airfoil_area(airfoilfile)
+fuselage_frontal_area = 0.010834279 #fuselage frontal area m^2
+fuselage_length = 0.3623 #m 
+mean_fuselage_diameter = 0.130 #m
+hstab_span = 1 #m
+hstab_chordlen = 0.25 #m
+hstab_aoa = -3 #hstab aoa in degrees (negative is below horizon)
+hstab_weight = 5 #Hstab weight, newtons
+cg_hstab_dist = 1.5 # distance between horizontal stabilizer and cg
+LE_cg_dist = 0.1 #distance from Leading edge to Cg in m
 #target_upper_camber_length = 0.4 #this can be used to fix chordlen, though not reccomended. The loss in efficiency is likely not gained by better SP coverage
+cd0_prefactor_hstab, cd0_expofactor_hstab = calc_CD0_regression(hstab_airfoil_file)
+cd0_prefactor, cd0_expofactor = calc_CD0_regression(airfoilfile)
+stab_lift_curve_slope = calc_lift_curve_slope(hstab_airfoil_file)
+wing_lift_curve_slope = calc_lift_curve_slope(airfoilfile)
 
+
+
+opti = asb.Opti()  # initialize an optimization environment
 ##Variables
 wingspan = opti.variable(init_guess=2.5)
+#hstab_span = opti.variable(init_guess = 1)
+#hstab_chordlen = opti.variable(init_guess = 0.25)
 chordlen = opti.variable(init_guess=0.4)
 airspeed = opti.variable(init_guess=10)  # cruising speed [m/s]
 weight = opti.variable(init_guess=50)  # total aircraft weight [N]
+wing_aoa = opti.variable(init_guess = 3)
 
 ##Derived
 aspect_ratio=wingspan/chordlen
 wing_area=wingspan*chordlen
+hstab_area = hstab_span * hstab_chordlen
 Re = (density / viscosity) * airspeed * (wing_area / aspect_ratio) ** 0.5
 oswald = 1.78 * (1- 0.045 * aspect_ratio**0.68) -0.64
-dynamic_pressure = 0.5 * density * airspeed ** 2
+dynamic_pressure = 0.5 * density * airspeed ** 2 
 
-#CD0=get_CD0(airfoilfile,Re)
+#Drag Dependencies
+    #wing drag
 CL = nf.get_aero_from_dat_file(
                 filename=airfoilfile,
                 alpha=wing_aoa,
@@ -176,34 +211,65 @@ CD_wing = CL / nf.get_aero_from_dat_file(
                 Re=Re,
                 model_size='xlarge'
             )["CD"]
-cd0_prefactor, cd0_expofactor = calc_CD0_regression(airfoilfile)
+
 CD0= cd0_prefactor * (Re ** cd0_expofactor)
+drag_parasite_wing =  wing_area * CD0 *dynamic_pressure
+drag_induced_wing = wing_area * dynamic_pressure * CL ** 2 / (np.pi * aspect_ratio * oswald)
+    #Form Drag (Fuselage)
+form_factor = 1+60/((fuselage_length/mean_fuselage_diameter)**3) + 0.0025*fuselage_length/mean_fuselage_diameter
+skin_friction_coefficient = 0.455/(np.log(Re)**2)
+CD_fuselage = form_factor *skin_friction_coefficient
+drag_fuselage = dynamic_pressure * fuselage_frontal_area * CD_fuselage
+    #Hstab drag
+Re_hstab = (density / viscosity) * airspeed *  hstab_chordlen
+CL_hstab = nf.get_aero_from_dat_file(
+                filename=hstab_airfoil_file,
+                alpha=-hstab_aoa,
+                Re=Re_hstab,
+                model_size='xlarge'
+            )["CL"]
+CD_wing_hstab = CL / nf.get_aero_from_dat_file(
+                filename=hstab_airfoil_file,
+                alpha=-hstab_aoa,
+                Re=Re_hstab,
+                model_size='xlarge'
+            )["CD"]
 
-
-CD_fuselage = drag_area_fuselage / wing_area #verify
-CD_parasite =  wing_area * CD0
-CD_induced = CL ** 2 / (np.pi * aspect_ratio * oswald)
-CD = CD_fuselage + CD_parasite + CD_induced
-dynamic_pressure = 0.5 * density * airspeed ** 2
-drag = dynamic_pressure * wing_area * CD
-lift_cruise = dynamic_pressure * wing_area * CL
+CD0_hstab= cd0_prefactor_hstab * (Re_hstab ** cd0_expofactor_hstab)
+drag_parasite_hstab =  hstab_area * CD0 *dynamic_pressure
+drag_induced_hstab = hstab_area * dynamic_pressure * CL_hstab ** 2 / (np.pi * hstab_span * oswald / hstab_chordlen)   
+    #totals
+drag= drag_induced_wing + drag_fuselage +drag_parasite_wing +drag_induced_hstab +drag_parasite_hstab
+lift_cruise = dynamic_pressure * wing_area * CL - (dynamic_pressure * hstab_chordlen * hstab_span * CL_hstab)
 
 ##Weight Dependency
 _,sp_weight = get_solar_panel_power_weight(wingspan,chordlen)
 foam_weight = airfoil_area * chordlen**2 *wingspan * foam_density * g
 spar_weight = 2*0.094*wingspan*g
 empennage_weight = 0.39*g
-weight = sp_weight + foam_weight+weight_fuselage+spar_weight+empennage_weight
+weight = sp_weight + foam_weight+weight_fuselage+spar_weight+empennage_weight +hstab_weight
 ##Power Relationship
-power_produced, _ = get_solar_panel_power_weight(wingspan,chordlen)
+power_produced_wing, _ = get_solar_panel_power_weight(wingspan,chordlen)
+power_produced_htab, _ = get_solar_panel_power_weight(hstab_span,hstab_chordlen)
 power_used = airspeed*drag
+power_produced = (power_produced_wing +power_produced_htab)
 power_ratio = power_produced / power_used
 
+## Stability
+#https://ciurpita.tripod.com/rc/notes/neutralPt.html
+aerodynamic_center = 0.25
+volume_coefficient = hstab_area * cg_hstab_dist / wing_area / chordlen
+neutral_point = aerodynamic_center +stabilizer_efficiency * volume_coefficient * 0.6 * stab_lift_curve_slope/wing_lift_curve_slope
+static_margin = neutral_point - LE_cg_dist/chordlen
 ##Constraints
-opti.subject_to(wingspan <= 3)
+opti.subject_to(wing_aoa >1)
+opti.subject_to(wing_aoa < 5)
+#opti.subject_to(wingspan <= 3)
 opti.subject_to(airspeed <= 30)
 opti.subject_to(weight <= lift_cruise)
-opti.subject_to(power_produced > power_used)
+opti.subject_to(power_ratio > 1)
+#opti.subject_to(hstab_span > 0)
+#opti.subject_to(hstab_chordlen > 0)
 
 #Objective
 opti.maximize(power_ratio)
@@ -218,8 +284,10 @@ for value in [
     "weight",
     "wingspan",
     "chordlen",
-    "CL",
-    "CD",
-    "CD0"
+    "wing_aoa",
+#    "hstab_span",
+#    "hstab_chordlen",
+    "static_margin",
+    "drag"
 ]:
     print(f"{value:10} = {sol(eval(value)):.6}")
